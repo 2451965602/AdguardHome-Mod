@@ -58,10 +58,36 @@ func TestParams_Validate(t *testing.T) {
 	}, {
 		name: "valid",
 		params: Params{
-			Enabled:  true,
-			QueueNum: 7,
-			Ports:    []uint16{443},
-			UIDs:     []string{"1000", "10000-19999"},
+			Enabled:     true,
+			QueueNum:    7,
+			Ports:       []uint16{443},
+			UIDs:        []string{"1000", "10000-19999"},
+			InspectQUIC: true,
+			QUICPorts:   []uint16{443, 853, 65535},
+		},
+		wantErr: false,
+	}, {
+		name: "inspect_quic_no_ports",
+		params: Params{
+			Enabled:     true,
+			Ports:       []uint16{443},
+			InspectQUIC: true,
+		},
+		wantErr: true,
+	}, {
+		name: "inspect_quic_zero_port",
+		params: Params{
+			Enabled:     true,
+			Ports:       []uint16{443},
+			InspectQUIC: true,
+			QUICPorts:   []uint16{443, 0},
+		},
+		wantErr: true,
+	}, {
+		name: "inspect_quic_disabled_empty_ports",
+		params: Params{
+			Enabled: true,
+			Ports:   []uint16{443},
 		},
 		wantErr: false,
 	}, {
@@ -157,7 +183,7 @@ func TestParsePacket(t *testing.T) {
 	}, {
 		name:    "ipv4_udp",
 		pkt:     withByte(tcpPacket4(src, dst, seq, ack, tcpFlagACK, nil), 9, 17),
-		wantErr: errNotTCPPacket,
+		wantErr: errNotUDPOrTCPPacket,
 	}, {
 		name: "ipv4_fragment",
 		// Set a non-zero fragment offset.

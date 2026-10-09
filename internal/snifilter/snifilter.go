@@ -1,15 +1,14 @@
 // Package snifilter implements the blocking of TLS connections by their SNI
-// values.
+// values and passively inspects QUIC Initial packets for DoQ/SNI.
 //
 // Filter lists of AdGuard Home know nothing about TLS connections that don't
 // use the DNS of AdGuard Home, for example the ones made by applications that
 // use their own DNS-over-HTTPS resolvers or connect to hard-coded addresses.
-// The server name in a ClientHello, however, is not encrypted, so it can be
-// used to block those connections as well.
+// TCP SNI and QUIC Initial ClientHello outer data can be inspected passively.
 //
 // The Linux implementation, see firewall_linux.go, uses NFQUEUE to peek at the
-// beginning of every outgoing TLS connection without taking over the routing,
-// and injects a TCP RST into the ones that are blocked.  It requires the
+// beginning of every outgoing TLS/QUIC connection without taking over the routing,
+// and injects a TCP RST only for blocked TCP connections.  It requires the
 // netfilter support for the "connbytes" and "NFQUEUE" targets in the kernel.
 package snifilter
 
@@ -66,8 +65,9 @@ const (
 
 // Errors returned by [parsePacket].
 var (
-	errNotIPPacket  = errors.Error("not an ip packet")
-	errNotTCPPacket = errors.Error("not a tcp packet")
+	errNotIPPacket       = errors.Error("not an ip packet")
+	errNotTCPPacket      = errors.Error("not a tcp packet")
+	errNotUDPOrTCPPacket = errors.Error("not a tcp or udp packet")
 )
 
 // Params is the configuration of the SNI filter read from the configuration
@@ -87,10 +87,15 @@ type Params struct {
 	// Enabled defines whether the SNI filtering is enabled.
 	Enabled bool `yaml:"enabled"`
 
-	// DropQUIC defines whether to reject the UDP traffic to Ports in order to
-	// make the clients fall back to TCP.  The server names in QUIC are
-	// encrypted, so the SNI filter cannot inspect it.
+	// DropQUIC defines whether to reject UDP traffic to configured ports.
 	DropQUIC bool `yaml:"drop_quic"`
+
+	// InspectQUIC enables passive inspection of QUIC client Initial packets.
+	InspectQUIC bool `yaml:"inspect_quic"`
+
+	// QUICPorts is the list of UDP ports to inspect for QUIC Initial packets.
+	// It must not be empty when InspectQUIC is true.
+	QUICPorts []uint16 `yaml:"quic_ports"`
 }
 
 // Validate returns an error if p isn't valid.
@@ -112,6 +117,18 @@ func (p *Params) Validate() (err error) {
 	for _, uids := range p.UIDs {
 		if !validUIDRange(uids) {
 			return fmt.Errorf("uids: invalid range %q", uids)
+		}
+	}
+
+	if p.InspectQUIC {
+		if len(p.QUICPorts) == 0 {
+			return errors.Error("quic_ports: empty")
+		}
+
+		for _, port := range p.QUICPorts {
+			if port == 0 {
+				return fmt.Errorf("quic_ports: invalid port %d", port)
+			}
 		}
 	}
 
@@ -188,10 +205,12 @@ type Filter struct {
 	// query log is not available.
 	queryLog querylog.QueryLog
 
-	ports    []uint16
-	uids     []string
-	queueNum uint16
-	dropQUIC bool
+	ports       []uint16
+	quicPorts   []uint16
+	uids        []string
+	queueNum    uint16
+	dropQUIC    bool
+	inspectQUIC bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -203,8 +222,9 @@ type Filter struct {
 
 // flowKey uniquely identifies a TCP connection.
 type flowKey struct {
-	src netip.AddrPort
-	dst netip.AddrPort
+	src      netip.AddrPort
+	dst      netip.AddrPort
+	protocol uint8
 }
 
 // flow is the state of a single inspected connection.
@@ -231,14 +251,16 @@ func New(c *Config) (f *Filter, err error) {
 	}
 
 	f = &Filter{
-		logger:   c.Logger,
-		filter:   c.Filter,
-		flows:    map[flowKey]*flow{},
-		queryLog: c.QueryLog,
-		ports:    slices.Clone(c.Ports),
-		uids:     slices.Clone(c.UIDs),
-		queueNum: c.QueueNum,
-		dropQUIC: c.DropQUIC,
+		logger:      c.Logger,
+		filter:      c.Filter,
+		flows:       map[flowKey]*flow{},
+		queryLog:    c.QueryLog,
+		ports:       slices.Clone(c.Ports),
+		quicPorts:   slices.Clone(c.QUICPorts),
+		uids:        slices.Clone(c.UIDs),
+		queueNum:    c.QueueNum,
+		dropQUIC:    c.DropQUIC,
+		inspectQUIC: c.InspectQUIC,
 	}
 
 	return f, nil
@@ -268,6 +290,7 @@ func (f *Filter) Start(ctx context.Context) (err error) {
 		"queue_num", f.queueNum,
 		"uid_ranges", f.uids,
 		"drop_quic", f.dropQUIC,
+		"inspect_quic", f.inspectQUIC,
 	)
 
 	return nil
@@ -307,7 +330,8 @@ type packet struct {
 	ack uint32
 
 	// flags are the TCP flags of the packet.
-	flags uint8
+	flags    uint8
+	protocol uint8
 }
 
 // rstSegment describes a TCP RST segment to inject.
@@ -349,13 +373,18 @@ type inspection struct {
 // to take for it.
 func (f *Filter) inspect(p *packet) (res inspection) {
 	res.verdict = verdictAccept
+	if p.protocol == 17 && (!f.inspectQUIC || !slices.Contains(f.quicPorts, p.dst.Port())) {
+		// UDP outside the configured QUIC ports is unrelated traffic.  Do not
+		// allocate flow state or attempt QUIC parsing for it.
+		return res
+	}
 
 	if p.flags&tcpFlagRST != 0 {
 		// The connection is already being torn down, nothing to inspect.
 		return res
 	}
 
-	key := flowKey{src: p.src, dst: p.dst}
+	key := flowKey{src: p.src, dst: p.dst, protocol: p.protocol}
 	now := time.Now()
 
 	f.mu.Lock()
@@ -377,6 +406,39 @@ func (f *Filter) inspect(p *packet) (res inspection) {
 
 		return res
 	}
+	if p.protocol == 6 && p.dst.Port() == 853 {
+		fl.decided, fl.blocked = true, true
+		f.mu.Unlock()
+		res.verdict = verdictReset
+		res.toClient, res.toServer = resetSegments(p)
+		return res
+	}
+	if p.protocol == 17 {
+		fl.decided = true
+		fl.blocked = false
+		f.mu.Unlock()
+		if !f.inspectQUIC {
+			return res
+		}
+		info, err := decryptQUICInitial(p.payload)
+		if err != nil {
+			return res
+		}
+		if slices.Contains(info.alpn, "doq") {
+			f.decide(key, true)
+			res.verdict = verdictDrop
+			return res
+		}
+		if info.serverName != "" {
+			filterRes := f.checkHost(info.serverName)
+			f.decide(key, filterRes.IsFiltered)
+			f.logConnection(p, info.serverName, filterRes)
+			if filterRes.IsFiltered {
+				res.verdict = verdictDrop
+			}
+		}
+		return res
+	}
 
 	if len(p.payload) > 0 && len(fl.handshake) < maxHandshakeSize {
 		fl.handshake = append(fl.handshake, p.payload...)
@@ -384,17 +446,27 @@ func (f *Filter) inspect(p *packet) (res inspection) {
 	handshake := fl.handshake
 	f.mu.Unlock()
 
-	name, err := sniffSNI(handshake)
+	info, err := sniffClientHello(handshake)
 	switch {
-	case err == nil && name != "":
-		filterRes := f.checkHost(name)
+	case err == nil && info.serverName != "":
+		if p.dst.Port() == 853 || slices.Contains(info.alpn, "dot") {
+			f.decide(key, true)
+			res.verdict = verdictReset
+			res.toClient, res.toServer = resetSegments(p)
+			return res
+		}
+		filterRes := f.checkHost(info.serverName)
 		blocked := filterRes.IsFiltered
 		f.decide(key, blocked)
-		f.logConnection(p, name, filterRes)
+		f.logConnection(p, info.serverName, filterRes)
 		if blocked {
 			res.verdict = verdictReset
 			res.toClient, res.toServer = resetSegments(p)
 		}
+	case err == nil && p.protocol == 6 && (p.dst.Port() == 853 || slices.Contains(info.alpn, "dot")):
+		f.decide(key, true)
+		res.verdict = verdictReset
+		res.toClient, res.toServer = resetSegments(p)
 	case err == nil:
 		f.decide(key, false)
 	case errors.Is(err, errNeedMore):
@@ -576,7 +648,7 @@ func parseIPv4Packet(b []byte) (p *packet, err error) {
 		return nil, errNotIPPacket
 	}
 
-	if b[9] != 6 {
+	if b[9] != 6 && b[9] != 17 {
 		return nil, errNotTCPPacket
 	}
 
@@ -603,7 +675,7 @@ func parseIPv4Packet(b []byte) (p *packet, err error) {
 	src = netip.AddrFrom4([4]byte(b[12:16]))
 	dst = netip.AddrFrom4([4]byte(b[16:20]))
 
-	return parseTCPPacket(b[headerLen:msgLen], src, dst)
+	return parseTransportPacket(b[headerLen:msgLen], src, dst, b[9])
 }
 
 // parseIPv6Packet parses an IPv6 packet and returns its TCP part.  The packets
@@ -614,7 +686,7 @@ func parseIPv6Packet(b []byte) (p *packet, err error) {
 		return nil, errNotIPPacket
 	}
 
-	if b[6] != 6 {
+	if b[6] != 6 && b[6] != 17 {
 		return nil, errNotTCPPacket
 	}
 
@@ -626,7 +698,28 @@ func parseIPv6Packet(b []byte) (p *packet, err error) {
 	src := netip.AddrFrom16([16]byte(b[8:24]))
 	dst := netip.AddrFrom16([16]byte(b[24:40]))
 
-	return parseTCPPacket(b[headerLen:msgLen], src, dst)
+	return parseTransportPacket(b[headerLen:msgLen], src, dst, b[6])
+}
+
+func parseTransportPacket(b []byte, src, dst netip.Addr, protocol uint8) (*packet, error) {
+	if protocol == 6 {
+		return parseTCPPacket(b, src, dst)
+	}
+	if len(b) < 8 {
+		return nil, errNotUDPOrTCPPacket
+	}
+	length := int(binary.BigEndian.Uint16(b[4:6]))
+	if length < 8 {
+		return nil, errNotUDPOrTCPPacket
+	}
+	if length > len(b) {
+		length = len(b)
+	}
+	return &packet{
+		src:     netip.AddrPortFrom(src, binary.BigEndian.Uint16(b[0:2])),
+		dst:     netip.AddrPortFrom(dst, binary.BigEndian.Uint16(b[2:4])),
+		payload: b[8:length], protocol: protocol,
+	}, nil
 }
 
 // parseTCPPacket parses a TCP packet and returns it.
@@ -642,11 +735,12 @@ func parseTCPPacket(b []byte, src, dst netip.Addr) (p *packet, err error) {
 	}
 
 	return &packet{
-		src:     netip.AddrPortFrom(src, binary.BigEndian.Uint16(b[0:2])),
-		dst:     netip.AddrPortFrom(dst, binary.BigEndian.Uint16(b[2:4])),
-		seq:     binary.BigEndian.Uint32(b[4:8]),
-		ack:     binary.BigEndian.Uint32(b[8:12]),
-		flags:   b[13],
-		payload: b[headerLen:],
+		src:      netip.AddrPortFrom(src, binary.BigEndian.Uint16(b[0:2])),
+		dst:      netip.AddrPortFrom(dst, binary.BigEndian.Uint16(b[2:4])),
+		seq:      binary.BigEndian.Uint32(b[4:8]),
+		ack:      binary.BigEndian.Uint32(b[8:12]),
+		flags:    b[13],
+		payload:  b[headerLen:],
+		protocol: 6,
 	}, nil
 }

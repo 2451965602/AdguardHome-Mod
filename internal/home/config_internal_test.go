@@ -10,6 +10,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestValidateSNIFilterUIDs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		data    string
+		wantErr bool
+	}{
+		{
+			name:    "missing",
+			data:    "sni_filter:\n  ports: [443]\n",
+			wantErr: true,
+		},
+		{
+			name: "explicit_empty",
+			data: "sni_filter:\n  uids: []\n",
+		},
+		{
+			name: "non_empty",
+			data: "sni_filter:\n  uids: [\"10000-19999\"]\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateSNIFilterUIDs([]byte(tc.data))
+			if tc.wantErr {
+				require.ErrorContains(t, err, "sni_filter.uids: missing")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestConfigFilePath(t *testing.T) {
 	const (
 		realConf       = "real.yaml"

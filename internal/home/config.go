@@ -525,11 +525,12 @@ var config = &configuration{
 		},
 	},
 	SNIFilter: snifilter.Params{
-		Enabled:  false,
-		QueueNum: defaultSNIQueueNum,
-		Ports:    []uint16{443, 8443},
-		UIDs:     []string{},
-		DropQUIC: false,
+		Enabled:     false,
+		QueueNum:    defaultSNIQueueNum,
+		Ports:       []uint16{443, 8443},
+		UIDs:        []string{},
+		DropQUIC:    false,
+		InspectQUIC: true,
 	},
 	OSConfig:      &osConfig{},
 	SchemaVersion: configmigrate.LastSchemaVersion,
@@ -697,6 +698,11 @@ func hasNilValue(m map[string]any) (ok bool) {
 // validateConfig returns error if the configuration is invalid.  l must not be
 // nil.
 func validateConfig(ctx context.Context, l *slog.Logger, fileData []byte) (err error) {
+	err = validateSNIFilterUIDs(fileData)
+	if err != nil {
+		return err
+	}
+
 	err = validateBindHosts(ctx, l, config, fileData)
 	if err != nil {
 		// Don't wrap the error since it's informative enough as is.
@@ -747,6 +753,35 @@ func validateConfig(ctx context.Context, l *slog.Logger, fileData []byte) (err e
 		// Clear the language so the frontend can use the client's browser
 		// language.
 		config.Language = ""
+	}
+
+	return nil
+}
+
+// validateSNIFilterUIDs rejects a missing or non-list sni_filter.uids value.
+// An explicitly empty list is valid and means all processes.
+func validateSNIFilterUIDs(fileData []byte) (err error) {
+	var conf struct {
+		SNIFilter *struct {
+			UIDs *yaml.Node `yaml:"uids"`
+		} `yaml:"sni_filter"`
+	}
+
+	err = yaml.Unmarshal(fileData, &conf)
+	if err != nil {
+		return fmt.Errorf("parsing sni_filter.uids: %w", err)
+	}
+
+	if conf.SNIFilter == nil {
+		return nil
+	}
+
+	if conf.SNIFilter.UIDs == nil {
+		return fmt.Errorf("sni_filter.uids: missing")
+	}
+
+	if conf.SNIFilter.UIDs.Kind != yaml.SequenceNode {
+		return fmt.Errorf("sni_filter.uids: must be a list")
 	}
 
 	return nil

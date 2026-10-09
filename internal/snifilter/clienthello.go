@@ -18,6 +18,8 @@ const (
 
 	// tlsExtServerName is the number of the server_name extension.
 	tlsExtServerName = 0x0000
+	tlsExtALPN       = 0x0010
+	tlsExtECH        = 0xfe0d
 
 	// tlsSNINameHostName is the name type of the host names within the
 	// server_name extension.
@@ -53,21 +55,32 @@ var (
 // An empty name with a nil error means that the ClientHello doesn't contain a
 // server name, for example when the client uses ECH or connects by an IP
 // address.
+type clientHelloInfo struct {
+	serverName string
+	alpn       []string
+	ech        bool
+}
+
 func sniffSNI(data []byte) (name string, err error) {
+	info, err := sniffClientHello(data)
+	return info.serverName, err
+}
+
+func sniffClientHello(data []byte) (info clientHelloInfo, err error) {
 	var handshake []byte
 
 	for off := 0; ; {
 		if len(data)-off < tlsRecordHeaderLen {
-			return "", errNeedMore
+			return info, errNeedMore
 		}
 
 		if data[off] != tlsRecordHandshake || data[off+1] != 0x03 {
-			return "", errNotTLS
+			return info, errNotTLS
 		}
 
 		recLen := int(binary.BigEndian.Uint16(data[off+3 : off+5]))
 		if recLen > tlsMaxRecordLen {
-			return "", errNotTLS
+			return info, errNotTLS
 		}
 
 		payload := data[off+tlsRecordHeaderLen:]
@@ -78,16 +91,16 @@ func sniffSNI(data []byte) (name string, err error) {
 		// A handshake message may span several records, so accumulate them.
 		handshake = append(handshake, payload...)
 
-		name, err = parseClientHello(handshake)
+		info, err = parseClientHello(handshake)
 		switch {
 		case err == nil:
-			return name, nil
+			return info, nil
 		case !errors.Is(err, errNeedMore):
 			// Don't wrap the error, because it's informative enough as is.
-			return "", err
+			return clientHelloInfo{}, err
 		case len(payload) < recLen:
 			// The record itself is incomplete.
-			return "", errNeedMore
+			return clientHelloInfo{}, errNeedMore
 		}
 
 		off += tlsRecordHeaderLen + recLen
@@ -96,18 +109,18 @@ func sniffSNI(data []byte) (name string, err error) {
 
 // parseClientHello extracts the server name from the handshake data in b.  b
 // may contain more data than the ClientHello itself.
-func parseClientHello(b []byte) (name string, err error) {
+func parseClientHello(b []byte) (info clientHelloInfo, err error) {
 	if len(b) < 4 {
-		return "", errNeedMore
+		return info, errNeedMore
 	}
 
 	if b[0] != tlsHandshakeClientHello {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
 
 	msgLen := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
 	if len(b) < 4+msgLen {
-		return "", errNeedMore
+		return info, errNeedMore
 	}
 
 	// Discard the rest of the handshake stream, it can only contain the
@@ -117,39 +130,54 @@ func parseClientHello(b []byte) (name string, err error) {
 	// Skip legacy_version (2 octets) and random (32 octets).
 	off := 34
 	if len(b) < off {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
 
 	// Skip legacy_session_id.
 	if off+1 > len(b) {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
-	off += 1 + int(b[off])
+	legacySessionIDLen := int(b[off])
+	off++
+	if off+legacySessionIDLen > len(b) {
+		return info, errNotTLS
+	}
+	off += legacySessionIDLen
 
 	// Skip cipher_suites.
 	if off+2 > len(b) {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
-	off += 2 + int(binary.BigEndian.Uint16(b[off:off+2]))
+	cipherSuitesLen := int(binary.BigEndian.Uint16(b[off : off+2]))
+	off += 2
+	if off+cipherSuitesLen > len(b) {
+		return info, errNotTLS
+	}
+	off += cipherSuitesLen
 
 	// Skip legacy_compression_methods.
 	if off+1 > len(b) {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
-	off += 1 + int(b[off])
+	compressionLen := int(b[off])
+	off++
+	if off+compressionLen > len(b) {
+		return info, errNotTLS
+	}
+	off += compressionLen
 
 	if off == len(b) {
 		// No extensions, and thus no server name.
-		return "", nil
+		return info, nil
 	}
 
 	if off+2 > len(b) {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
 	extLen := int(binary.BigEndian.Uint16(b[off : off+2]))
 	off += 2
 	if off+extLen > len(b) {
-		return "", errNotTLS
+		return info, errNotTLS
 	}
 	extensions := b[off : off+extLen]
 
@@ -157,17 +185,53 @@ func parseClientHello(b []byte) (name string, err error) {
 		extType := int(binary.BigEndian.Uint16(extensions[:2]))
 		extLen := int(binary.BigEndian.Uint16(extensions[2:4]))
 		if 4+extLen > len(extensions) {
-			return "", errNotTLS
+			return info, errNotTLS
 		}
 
-		if extType == tlsExtServerName {
-			return parseServerName(extensions[4 : 4+extLen])
+		switch extType {
+		case tlsExtServerName:
+			info.serverName, err = parseServerName(extensions[4 : 4+extLen])
+			if err != nil {
+				return clientHelloInfo{}, err
+			}
+		case tlsExtALPN:
+			info.alpn, err = parseALPN(extensions[4 : 4+extLen])
+			if err != nil {
+				return clientHelloInfo{}, err
+			}
+		case tlsExtECH:
+			info.ech = true
 		}
 
 		extensions = extensions[4+extLen:]
 	}
+	if len(extensions) != 0 {
+		return info, errNotTLS
+	}
 
-	return "", nil
+	return info, nil
+}
+
+func parseALPN(b []byte) ([]string, error) {
+	if len(b) < 2 {
+		return nil, errNotTLS
+	}
+	n := int(binary.BigEndian.Uint16(b[:2]))
+	if n != len(b)-2 {
+		return nil, errNotTLS
+	}
+	b = b[2:]
+	var protocols []string
+	for len(b) > 0 {
+		l := int(b[0])
+		b = b[1:]
+		if l == 0 || l > len(b) {
+			return nil, errNotTLS
+		}
+		protocols = append(protocols, string(b[:l]))
+		b = b[l:]
+	}
+	return protocols, nil
 }
 
 // parseServerName extracts the host name from the data of the server_name

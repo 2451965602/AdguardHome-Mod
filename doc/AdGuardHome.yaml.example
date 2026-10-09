@@ -215,21 +215,31 @@ sni_filter:
     - 8443
   # NFQUEUE 队列号，别用 0（最容易和别的工具撞车）。
   queue_num: 7
-  # 只检查这些 UID（或 UID 范围，如 "10000-19999"）的进程；空数组表示所有进程。
-  # 手机上一般填应用 UID 段，这样代理模块与 AdGuardHome 自身的出站不会被抓。
-  uids: []
+  # UID 或 UID 范围必须写成 YAML 字符串；核心和 Magisk 脚本均支持显式 uids: []，表示全部进程。
+  # 此时模块规则不添加 owner 匹配；仅缺失或无效的 UID 列表会 fail closed。下面的范围仅为示例。
+  # Magisk 脚本也从此处读取 UID 范围，不从 scripts/config.prop 读取。
+  uids:
+    - "90000-99999"
   # 是否启用。默认关闭；把拦截模式设为 strong（强力模式）时不需要打开这一项。
   enabled: false
-  # HTTP/3 走 UDP 443，SNI 是加密的，拦不住。打开这一项会 REJECT 掉 UDP 443，
-  # 逼客户端回退到 TCP，代价是没有 HTTP/3。
+  # 兼容旧配置的字段；当前 AdGuardHome 核心和 Magisk 脚本均不据此阻断 UDP。
   drop_quic: false
+  # 是否被动检查 QUIC v1/v2 客户端 Initial 中的 TLS ClientHello。默认开启；
+  # 只识别 outer SNI/ALPN/ECH，不解密 HTTPS 请求。不可解析或分片的数据放行。
+  inspect_quic: true
+  # 被动检查 QUIC Initial 的 UDP 目标端口；仅 inspect_quic=true 时必填，范围 1..65535。
+  quic_ports:
+    - 443
+    - 853
+    - 784
+    - 8853
   # AdGuardHome 不碰 iptables：它只开 NFQUEUE、读包、发 RST，把包送进队列的规则
-  # 由外部脚本安装、清理——例如 Magisk 模块的 iptables.sh（端口在模块自己的
-  # config.prop 里，队列号从这里读）。外部脚本必须带 --queue-bypass，否则
+  # 由外部脚本安装、清理——例如 Magisk 模块的 iptables.sh（端口、UID 范围和队列号
+  # 都从本 YAML 的 sni_filter 段读取；config.prop 不配置这些规则）。外部脚本必须带 --queue-bypass，否则
   # AdGuardHome 没跑时 443 会卡住。
   #
-  # 上面三项（ports / uids / drop_quic）只是对规则应有的样子做描述，AdGuardHome
-  # 自己不再据此安装规则，保留它们是为了兼容旧配置。
+  # ports / uids / quic_ports 描述外部规则应使用的范围；AdGuardHome 不安装规则。
+  # inspect_quic 控制核心是否解析已入队的 QUIC Initial 包；drop_quic 当前不生效。
 
 # 客户端的持久化配置。Mod 删掉了「客户端设置」界面，但这一段与 /control/clients
 # 接口还保留着（第三方管理器要读）；官方版本写的 safe_search / blocked_services /

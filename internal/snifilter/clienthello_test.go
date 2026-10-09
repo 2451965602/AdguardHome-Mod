@@ -84,6 +84,53 @@ func TestSniffSNI(t *testing.T) {
 	})
 }
 
+func TestParseClientHelloMetadata(t *testing.T) {
+	t.Parallel()
+	data := testClientHello([]byte("example.test"), []string{"h3", "doq"}, true)
+	info, err := sniffClientHello(appendTLSRecord(nil, data))
+	require.NoError(t, err)
+	assert.Equal(t, "example.test", info.serverName)
+	assert.Equal(t, []string{"h3", "doq"}, info.alpn)
+	assert.True(t, info.ech)
+}
+
+// testClientHello creates a minimal TLS ClientHello handshake for parser tests.
+func testClientHello(host []byte, alpn []string, ech bool) []byte {
+	var extensions []byte
+	if host != nil {
+		name := append([]byte{tlsSNINameHostName}, byte(len(host)>>8), byte(len(host)))
+		name = append(name, host...)
+		sni := append([]byte{byte(len(name) >> 8), byte(len(name))}, name...)
+		extensions = appendTLSFixtureExtension(extensions, tlsExtServerName, sni)
+	}
+	if alpn != nil {
+		var protocols []byte
+		for _, p := range alpn {
+			protocols = append(protocols, byte(len(p)))
+			protocols = append(protocols, p...)
+		}
+		payload := append([]byte{byte(len(protocols) >> 8), byte(len(protocols))}, protocols...)
+		extensions = appendTLSFixtureExtension(extensions, tlsExtALPN, payload)
+	}
+	if ech {
+		extensions = appendTLSFixtureExtension(extensions, tlsExtECH, []byte{0, 1, 2})
+	}
+	body := make([]byte, 34)
+	body[0], body[1] = 3, 3
+	body = append(body, 0)                // session id
+	body = append(body, 0, 2, 0x13, 0x01) // cipher suite
+	body = append(body, 1, 0)             // compression
+	body = append(body, byte(len(extensions)>>8), byte(len(extensions)))
+	body = append(body, extensions...)
+	return append([]byte{tlsHandshakeClientHello, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
+}
+
+func appendTLSFixtureExtension(b []byte, typ int, data []byte) []byte {
+	b = binary.BigEndian.AppendUint16(b, uint16(typ))
+	b = binary.BigEndian.AppendUint16(b, uint16(len(data)))
+	return append(b, data...)
+}
+
 // TestSniffSNI_badData tests the parsing of the malformed ClientHello
 // messages.
 func TestSniffSNI_badData(t *testing.T) {

@@ -120,13 +120,15 @@ sni_filter:
   enabled: false
   queue_num: 7          # 别用 0；脚本也从这里读队列号
   ports: [443, 8443]    # 只描述规则，AdGuardHome 自己不装规则
-  uids: []              # 同上；例如 ["10000-19999"]，空表示所有进程
-  drop_quic: false      # 同上；打开则由脚本 REJECT UDP 443，逼 HTTP/3 回退 TCP
+  uids: ["90000-99999"] # 示例 UID 范围；Magisk 脚本从这里读取，范围必须是 YAML 字符串
+  drop_quic: false      # 兼容旧配置的字段；当前核心和模块脚本都不据此阻断 UDP
+  inspect_quic: true
+  quic_ports: [443, 853, 784, 8853] # inspect_quic 开启时必填，检查这些 UDP 端口
 ```
 
 `filtering.blocking_mode: strong` 时上面这一段自动生效，不需要把 `enabled` 打开。
 
-**规则由外部脚本维护**：AdGuardHome 只开 NFQUEUE、读包、发 RST，从不安装/清理/自愈 iptables 规则（早先为同时支持两种模式加过 `manage_rules` 开关，现已删除——内核没有 `xt_multiport` 时它自己装规则会失败，把规则完全交给脚本就没有这个问题）。Magisk 模块走的就是这条：`scripts/iptables.sh` 的 `rebuild_sni` 维护 `filter` 表里的 `AGH_SNI` 链（`-o lo -j RETURN` + 逐端口 `-p tcp --dport N -m owner --uid-owner … -m connbytes … -j NFQUEUE --queue-num N --queue-bypass`，v4/v6 各一份），5 秒守护循环里用 `-C` 检查、缺了就重建；端口来自模块自己的 `scripts/config.prop`（`sni_ports`），队列号从 `AdGuardHome.yaml` 的 `sni_filter.queue_num` 读，避免两边写死不同值。配置里的 `ports`/`uids`/`drop_quic` 现在只是描述性字段，AdGuardHome 不使用，保留是为了兼容旧配置。
+**规则由外部脚本维护**：AdGuardHome 只开 NFQUEUE、读包、发 RST，从不安装/清理/自愈 iptables 规则（早先为同时支持两种模式加过 `manage_rules` 开关，现已删除——内核没有 `xt_multiport` 时它自己装规则会失败，把规则完全交给脚本就没有这个问题）。Magisk 模块走的就是这条：模块脚本维护 TCP SNI 与 QUIC UDP 队列规则；TCP `ports`、`uids`、`quic_ports` 和队列号都从 `AdGuardHome.yaml` 的 `sni_filter` 段读取，`scripts/config.prop` 不配置这些规则（目前只配置 DNS 重定向端口）。`ports`、`uids`、`quic_ports` 描述外部规则范围；队列号供核心和脚本共同使用；核心用 `inspect_quic` 控制是否检查已入队的 QUIC Initial。核心和 Magisk 脚本均将显式配置的 `uids: []` 视为全部进程；脚本对此不添加 owner 匹配条件。仅缺失或无效的 UID 列表会 fail closed 并移除相关规则。
 
 外部规则的硬要求：**必须带 `--queue-bypass`**，否则 AdGuardHome 没在跑时进队列的包没人判决，443 会整段卡住；链名建议沿用 `AGH_SNI`（AGH 侧的启动日志和文档都用这个名字）。
 
@@ -138,7 +140,7 @@ sni_filter:
 
 - 内核必须支持 `xt_connbytes` 与 `NFQUEUE`（nft 后端也行）。厂商内核可能裁剪，真机上先跑一条 `iptables -t filter -I OUTPUT -p tcp --dport 443 -j NFQUEUE --queue-num 7 --queue-bypass` 验证。
 - 注入的 RST 源地址是远端 IP，靠本机 IP 栈绕回本地 socket；`net.ipv4.conf.*.rp_filter` 若是**严格模式（1）**，这个包会被丢掉，效果退化成「连接一直挂着」（仍然拦截，只是慢）。部分 ROM 要留意。
-- HTTP/3（QUIC）的 SNI 是加密的，拦不到，只能 `drop_quic: true` 逼回退 TCP。ECH 普及后这条路也会静默失效。
+- 启用 `inspect_quic` 后，核心可检查配置 UDP 端口上的 QUIC Initial，识别 DoQ 并检查可解析的外层 ClientHello；它不解密 DoH。ECH、IP 直连及无法解析的数据仍会放行。`drop_quic` 目前只是兼容字段，核心和 Magisk 脚本均不据此阻断 UDP；QUIC 检查由 `inspect_quic` 控制。
 - 只看进程 UID、不看客户端 IP：手机上的应用都在同一台机器上，所以**按客户端区分的过滤规则在 SNI 层不生效**，只按全局规则判定（`setts.ProtectionEnabled` 恒为真）。
 - **SNI 走查询日志，不走主日志**：每条解析出 SNI 的连接都会写进查询日志（`internal/snifilter/snifilter.go` 的 `logConnection`），域名就是 SNI。原因换成 SNI 专用的两个值，好把 TLS 连接与 DNS 请求分开：被拦的是 `filtering.FilteredSNI`（界面显示「已阻止（SNI）」，仍归入「已阻止」筛选），放行的是 `filtering.NotFilteredSNI`（显示「已处理（SNI）」）——过滤引擎给的原因不再写进查询日志，但命中的规则照旧带上，所以「命中允许规则」的连接改看规则列而不是「允许项」筛选。SNI 记录还多一个 **`destination`**（`AddParams.Dst` → `logEntry.Dst` → `entryToJSON` 的 `destination`，前端在响应详情里渲染成一行「目标地址」）：连接的目标 IP:端口，DNS 查询没有这一维，只有 SNI 过滤能看到应用最终连到哪个地址。主日志只在启动/停止、出错误的时候写，不再逐条打印连接；RST 发不出去也只记 debug。
 - 查询日志里记的是**每条连接**（放行的也记），手机上流量大时会把查询日志刷得比较快，日志轮转要不要调（`querylog.mem_size` / `interval`）按实际用量定。
