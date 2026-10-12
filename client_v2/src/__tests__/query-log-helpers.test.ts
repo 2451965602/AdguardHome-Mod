@@ -1,0 +1,205 @@
+import { afterEach, describe, expect, test, vi } from 'vitest';
+
+import intl from 'panel/common/intl';
+import { FILTERED_STATUS, SPECIAL_FILTER_ID } from '../helpers/constants';
+import {
+    filterLogsByStatus,
+    getQueryReasonLabel,
+    getQueryReasonDetails,
+    getQueryReasonKey,
+    getQueryStatusLabel,
+    getQueryStatusKey,
+    getProtocolName,
+    getStatusLabel,
+} from '../components/QueryLog/helpers';
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
+
+describe('getQueryStatusKey', () => {
+    test('maps rewrites to rewritten status', () => {
+        expect(getQueryStatusKey(FILTERED_STATUS.REWRITE)).toBe('rewritten');
+    });
+
+    test('maps allowlisted and plain answers to allowed/processed', () => {
+        expect(getQueryStatusKey(FILTERED_STATUS.NOT_FILTERED_WHITE_LIST)).toBe('allowed');
+        expect(getQueryStatusKey(FILTERED_STATUS.NOT_FILTERED_NOT_FOUND)).toBe('processed');
+    });
+
+    test('maps SNI entries to blocked/processed statuses', () => {
+        expect(getQueryStatusKey(FILTERED_STATUS.FILTERED_SNI)).toBe('blocked');
+        expect(getQueryStatusKey(FILTERED_STATUS.NOT_FILTERED_SNI)).toBe('processed');
+    });
+
+    test('falls back to rewritten when the row has an original response', () => {
+        expect(
+            getQueryStatusKey('UnexpectedReason', [{ value: '203.0.113.10', type: 'A', ttl: 300 }]),
+        ).toBe('rewritten');
+    });
+});
+
+describe('getQueryReasonKey', () => {
+    test('keeps custom rules separate from blocklist rules', () => {
+        expect(
+            getQueryReasonKey(FILTERED_STATUS.FILTERED_BLACK_LIST, [
+                {
+                    filter_list_id: SPECIAL_FILTER_ID.CUSTOM_FILTERING_RULES,
+                    text: '||example.org^',
+                },
+            ]),
+        ).toBe('custom_filtering_rules');
+
+        expect(
+            getQueryReasonKey(FILTERED_STATUS.FILTERED_BLACK_LIST, [
+                { filter_list_id: 42, text: '||example.org^' },
+            ]),
+        ).toBe('blocked_by_filter');
+    });
+
+    test('maps threat, parental, allowlist, and rewrite reasons', () => {
+        expect(getQueryReasonKey(FILTERED_STATUS.FILTERED_SAFE_BROWSING, [])).toBe(
+            'blocked_threats',
+        );
+        expect(getQueryReasonKey(FILTERED_STATUS.FILTERED_PARENTAL, [])).toBe(
+            'blocked_by_parental_control',
+        );
+        expect(getQueryReasonKey(FILTERED_STATUS.NOT_FILTERED_WHITE_LIST, [])).toBe('allowlists');
+        expect(getQueryReasonKey(FILTERED_STATUS.REWRITE, [])).toBe('dns_rewrites');
+    });
+
+    test('maps filtered SNI entries to the blocked-by-filter reason', () => {
+        expect(getQueryReasonKey(FILTERED_STATUS.FILTERED_SNI, [])).toBe('blocked_by_filter');
+    });
+});
+
+describe('query log label helpers', () => {
+    test('maps status keys through static intl keys', () => {
+        const getMessageSpy = vi.spyOn(intl, 'getMessage').mockImplementation((key) => key);
+
+        expect(getQueryStatusLabel('blocked')).toBe('query_log_blocked');
+        expect(getQueryStatusLabel('allowed')).toBe('query_log_allowed');
+        expect(getQueryStatusLabel('processed')).toBe('query_log_processed');
+        expect(getQueryStatusLabel('rewritten')).toBe('query_log_rewritten');
+        expect(getQueryStatusLabel('error')).toBe('error');
+
+        expect(getMessageSpy).toHaveBeenNthCalledWith(1, 'query_log_blocked');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(2, 'query_log_allowed');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(3, 'query_log_processed');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(4, 'query_log_rewritten');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(5, 'error');
+    });
+
+    test('maps reason keys through static intl keys and keeps none literal', () => {
+        const getMessageSpy = vi.spyOn(intl, 'getMessage').mockImplementation((key) => key);
+
+        expect(getQueryReasonLabel('none')).toBe('-');
+        expect(getQueryReasonLabel('blocked_by_filter')).toBe('query_log_blocked_by_filter');
+        expect(getQueryReasonLabel('custom_filtering_rules')).toBe(
+            'query_log_custom_filtering_rules',
+        );
+        expect(getQueryReasonLabel('blocked_threats')).toBe('query_log_blocked_threats');
+        expect(getQueryReasonLabel('blocked_by_parental_control')).toBe(
+            'query_log_blocked_by_parental_control',
+        );
+        expect(getQueryReasonLabel('dns_rewrites')).toBe('dns_rewrites');
+        expect(getQueryReasonLabel('allowlists')).toBe('allowlists');
+        expect(getQueryReasonLabel('error')).toBe('error');
+
+        expect(getMessageSpy).toHaveBeenNthCalledWith(1, 'query_log_blocked_by_filter');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(2, 'query_log_custom_filtering_rules');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(3, 'query_log_blocked_threats');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(4, 'query_log_blocked_by_parental_control');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(5, 'dns_rewrites');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(6, 'allowlists');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(7, 'error');
+    });
+
+    test('maps SNI entries to their dedicated status labels', () => {
+        const getMessageSpy = vi.spyOn(intl, 'getMessage').mockImplementation((key) => key);
+
+        expect(getStatusLabel(FILTERED_STATUS.FILTERED_SNI, [], false)).toBe('blocked_by_sni');
+        expect(getStatusLabel(FILTERED_STATUS.NOT_FILTERED_SNI, [], false)).toBe('allowed_by_sni');
+
+        expect(getMessageSpy).toHaveBeenNthCalledWith(1, 'blocked_by_sni');
+        expect(getMessageSpy).toHaveBeenNthCalledWith(2, 'allowed_by_sni');
+    });
+
+    test('does not show a DNS protocol for SNI entries', () => {
+        expect(getProtocolName('', FILTERED_STATUS.FILTERED_SNI)).toBe('');
+        expect(getProtocolName('', FILTERED_STATUS.NOT_FILTERED_SNI)).toBe('');
+    });
+});
+
+describe('getQueryReasonDetails', () => {
+    const filters = [
+        {
+            enabled: true,
+            id: 42,
+            lastUpdated: '',
+            name: 'AdGuard DNS filter',
+            rulesCount: 0,
+            url: '',
+        },
+    ];
+
+    const whitelistFilters = [
+        {
+            enabled: true,
+            id: 7,
+            lastUpdated: '',
+            name: "Dan Pollock's List",
+            rulesCount: 0,
+            url: '',
+        },
+    ];
+
+    test('returns filter names for blocklist and allowlist reasons', () => {
+        expect(
+            getQueryReasonDetails({
+                elapsedMs: '17',
+                filters,
+                reason: FILTERED_STATUS.FILTERED_BLACK_LIST,
+                rules: [{ filter_list_id: 42, text: '||example.org^' }],
+                whitelistFilters,
+            }),
+        ).toBe('AdGuard DNS filter');
+
+        expect(
+            getQueryReasonDetails({
+                elapsedMs: '31',
+                filters,
+                reason: FILTERED_STATUS.NOT_FILTERED_WHITE_LIST,
+                rules: [{ filter_list_id: 7, text: '@@||example.org^' }],
+                whitelistFilters,
+            }),
+        ).toBe("Dan Pollock's List");
+    });
+});
+
+describe('filterLogsByStatus', () => {
+    const logs = [
+        { reason: FILTERED_STATUS.NOT_FILTERED_NOT_FOUND, originalResponse: [] },
+        { reason: FILTERED_STATUS.FILTERED_BLACK_LIST, originalResponse: [] },
+        { reason: FILTERED_STATUS.NOT_FILTERED_WHITE_LIST, originalResponse: [] },
+        { reason: FILTERED_STATUS.REWRITE, originalResponse: [] },
+    ] as any[];
+
+    test('filters logs by generic status category', () => {
+        expect(filterLogsByStatus(logs, 'processed')).toHaveLength(1);
+        expect(filterLogsByStatus(logs, 'blocked')).toHaveLength(1);
+        expect(filterLogsByStatus(logs, 'allowed')).toHaveLength(1);
+        expect(filterLogsByStatus(logs, 'rewritten')).toHaveLength(1);
+        expect(filterLogsByStatus(logs, 'all')).toHaveLength(4);
+    });
+
+    test('filters SNI entries into blocked and processed categories', () => {
+        const sniLogs = [
+            { reason: FILTERED_STATUS.FILTERED_SNI, originalResponse: [] },
+            { reason: FILTERED_STATUS.NOT_FILTERED_SNI, originalResponse: [] },
+        ] as any[];
+
+        expect(filterLogsByStatus(sniLogs, 'blocked')).toEqual([sniLogs[0]]);
+        expect(filterLogsByStatus(sniLogs, 'processed')).toEqual([sniLogs[1]]);
+    });
+});

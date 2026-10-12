@@ -19,12 +19,12 @@ GO.MACRO = $${GO:-go}
 VERBOSE.MACRO = $${VERBOSE:-0}
 
 CHANNEL = development
-CLIENT_DIR = client
+CLIENT_DIR = client_v2
 DIST_DIR = dist
 GOAMD64 = v1
 GOPROXY = https://proxy.golang.org|direct
 GOTELEMETRY = off
-GOTOOLCHAIN = go1.26.8
+GOTOOLCHAIN = go1.27.1
 GPG_KEY = devteam@adguard.com
 GPG_KEY_PASSPHRASE = not-a-real-password
 NPM = npm

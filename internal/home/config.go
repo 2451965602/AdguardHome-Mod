@@ -485,12 +485,12 @@ var config = &configuration{
 	// TODO(a.garipov): Think of a way to make scripts/vetted-filters update
 	// these as well if necessary.
 	Filters: []filtering.FilterYAML{{
-		Filter:  filtering.Filter{ID: 1},
+		ID:      1,
 		Enabled: true,
 		URL:     "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
 		Name:    "AdGuard DNS filter",
 	}, {
-		Filter:  filtering.Filter{ID: 2},
+		ID:      2,
 		Enabled: false,
 		URL:     "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt",
 		Name:    "AdAway Default Blocklist",
@@ -525,7 +525,6 @@ var config = &configuration{
 		},
 	},
 	SNIFilter: snifilter.Params{
-		Enabled:  false,
 		QueueNum: defaultSNIQueueNum,
 		Ports:    []uint16{443, 8443},
 		UIDs:     []string{},
@@ -929,8 +928,8 @@ func (cm *defaultConfigModifier) Apply(ctx context.Context) {
 		cm.logger.ErrorContext(ctx, "writing config", slogutil.KeyError, err)
 	}
 
-	// The SNI filtering follows both the sni_filter section and the blocking
-	// mode, so it has to be started or stopped along with them.
+	// The SNI filtering follows the blocking mode, so it has to be started or
+	// stopped along with it.
 	syncSNIFilter(ctx, cm.logger)
 }
 
