@@ -10,6 +10,7 @@
 
 ## 1. 现状速览
 
+- 上游基线：**AdGuardHome v1.0.0-b.1**（commit `73d4aab`，2026-09-30）。本 mod 的 `internal/`、`client/`（v1 前端）与 `go.mod` 已同步到该版本；同步时有意没有跟进 `client_v2`、DHCP、安全搜索、已阻止的服务、加密设置的删减，`internal/configmgr` 那些仍未使用的重构也只是保持原样。同步方法与必查项见第 10 节。
 - 默认分支 `main`，当前 HEAD `bf485a1d`。里面是 PR #6（删页面与功能）、#7（README 中文优先）、#8（「精简版」改名「修改版 / Mod」）。
 - 已发布 `v2026-09-24`（预发布），产物三个：`AdGuardHome_linux_amd64.tar.gz`、`AdGuardHome_linux_arm64.tar.gz`、`checksums.txt`。
 - 只支持 `linux/amd64` 与 `linux/arm64`，其它平台代码已经从仓库里删掉。
@@ -77,7 +78,7 @@ gh release delete v2026-09-24 --repo herta0426/AdguardHome-Mod --cleanup-tag --y
 
 ### 2.6 自己加的功能：SNI 阻断（`sni_filter`）
 
-这是本项目第一个「不只是做减法」的功能，默认关闭，只在 Linux 上生效。
+这是本项目第一个「不只是做减法」的功能，只在 Linux 上生效，跟随强力模式。
 
 **解决什么问题。** DNS 过滤看不到两类流量：应用自己走 DoH（443 端口，绕开系统 DNS），以及把 IP 写死在代码里的 Ad SDK。这两种连接的 ClientHello 里 SNI 是明文，所以能在连接建立时按域名拦掉，用的是**同一套过滤规则**，不需要另外维护清单。
 
@@ -91,7 +92,7 @@ gh release delete v2026-09-24 --repo herta0426/AdguardHome-Mod --cleanup-tag --y
 **强力模式。** `filtering.blocking_mode: strong`（DNS 设置页里叫「强力模式」）把上面这套和 DNS 拦截合成一个开关：
 
 - DNS 半边在 `internal/dnsforward/msg.go` 的 `genForBlockingMode` 里加了一个分支，直接调已有的 `NewMsgNODATA`，也就是 NOERROR + 空 answer + SOA。A/AAAA/HTTPS 走这个分支，其它 qtype 本来就走 NODATA。
-- SNI 半边由 `internal/home/dns.go` 的 `syncSNIFilter` 负责：只要 `sni_filter.enabled` 为真**或**当前拦截模式是 strong，就确保 SNI 过滤在跑，否则确保它停掉。`config.Filtering` 的拦截模式是运行时可变的值，所以判断要读 `globalContext.filters.BlockingMode()`，不要读 `config.Filtering.BlockingMode`。
+- SNI 半边由 `internal/home/dns.go` 的 `syncSNIFilter` 负责：只要当前拦截模式是 strong 就确保 SNI 过滤（NFQUEUE）在跑，否则确保它停掉。这里**没有单独的开关**：`sni_filter` 段里没有 `enabled` 键，代码里也没有「因为配置没开而跳过注册」的路径。`config.Filtering` 的拦截模式是运行时可变的值，所以判断要读 `globalContext.filters.BlockingMode()`，不要读 `config.Filtering.BlockingMode`。
 - `syncSNIFilter` 在两个地方被调用：`initDNS` 末尾（启动）和 `defaultConfigModifier.Apply`（每次配置写盘后，`/control/dns_config` 会走到这里）。所以「在界面里切成强力模式」不需要重启，DNS 半边立即生效、RST 半边在保存配置时同步启停。
 - 启动/停止的临界区由 `homeContext.sniLock` 保护；`syncSNIFilter` 在 `globalContext.filters` 或 `globalContext.dnsServer` 为空时直接返回，避免在关机过程中把规则又装回去。
 
@@ -117,7 +118,6 @@ gh release delete v2026-09-24 --repo herta0426/AdguardHome-Mod --cleanup-tag --y
 
 ```yaml
 sni_filter:
-  enabled: false
   queue_num: 7          # 别用 0；脚本也从这里读队列号
   ports: [443, 8443]    # 只描述规则，AdGuardHome 自己不装规则
   uids: ["90000-99999"] # 示例 UID 范围；Magisk 脚本从这里读取，范围必须是 YAML 字符串
@@ -126,7 +126,13 @@ sni_filter:
   quic_ports: [443, 853, 784, 8853] # inspect_quic 开启时必填，检查这些 UDP 端口
 ```
 
-`filtering.blocking_mode: strong` 时上面这一段自动生效，不需要把 `enabled` 打开。
+`filtering.blocking_mode: strong` 时上面这一段自动生效；切成别的模式则把队列停掉。
+
+**吞吐加固（事件驱动）。** `internal/snifilter/{firewall_linux.go,clienthello.go,snifilter.go}` 做了三件事，让 SNI 拦截在极端流量下不容易被拖垮：
+
+1. **快速短路**：NFQUEUE 回调先做纯字节比对（IP 头、协议、目的端口、TCP 头、TLS 记录头与 ClientHello 类型），任何一步不满足立刻放行，零分配、不写日志；只有可能带 SNI 的包才进入连接表。`Filter.pktPool` 与 `helloBufPool` 复用包结构与握手缓冲。
+2. **无条件注册**：如上所述，strong 模式下不存在因为 `enabled` 而跳过注册的路径。
+3. **队列丢失自愈**：注册队列后用 `epoll` 监听 netlink socket 的 `EPOLLHUP`/`EPOLLERR`（epoll 不可用时退回 `poll`），内核断开队列时立刻关闭旧 socket 并重新注册，事件驱动、不轮询；关机会先写 eventfd 唤醒等待再退出。
 
 **规则由外部脚本维护**：AdGuardHome 只开 NFQUEUE、读包、发 RST，从不安装/清理/自愈 iptables 规则（早先为同时支持两种模式加过 `manage_rules` 开关，现已删除——内核没有 `xt_multiport` 时它自己装规则会失败，把规则完全交给脚本就没有这个问题）。Magisk 模块走的就是这条：模块脚本维护 TCP SNI 与 QUIC UDP 队列规则；TCP `ports`、`uids`、`quic_ports` 和队列号都从 `AdGuardHome.yaml` 的 `sni_filter` 段读取，`scripts/config.prop` 不配置这些规则（目前只配置 DNS 重定向端口）。`ports`、`uids`、`quic_ports` 描述外部规则范围；队列号供核心和脚本共同使用；核心用 `inspect_quic` 控制是否检查已入队的 QUIC Initial。核心和 Magisk 脚本均将显式配置的 `uids: []` 视为全部进程；脚本对此不添加 owner 匹配条件。仅缺失或无效的 UID 列表会 fail closed 并移除相关规则。
 
@@ -397,15 +403,17 @@ make js-deps js-lint js-typecheck js-test js-build
 - 在 `CHANGELOG.md` 里加一条「同步上游 <版本/日期>」并写明保留与重新删除的内容。
 - 合并到 `main` → 按第 7 节发版；先在 Actions 里手跑一次试构建，产物在手机上实跑再打 tag。
 
-## 11. 上游新版前端（client_v2）：为什么不用、以后怎么迁、怎么不冲突
+## 11. 上游新版前端（client_v2）：现状、迁移记录与注意事项
+
+**现状（2026-10 起）：本 mod 已经切到 `client_v2`。** 之前不用它，是因为当时 v2 还没进 beta；AdGuardHome v1.0.0-b.1 把 `client_v2` 定为默认前端（`Makefile` 的 `CLIENT_DIR = client_v2`，`NEXTAPI = 0`，即只用新前端、不启用 `internal/next`），mod 也随之切换（路线 A：只换前端）。下面 11.3、11.4 保留为当时的决策记录与迁移清单。
 
 ### 11.1 现状：上游有两套前端、两套后端
 
 | 项目 | 我们的 fork | 上游 `master` |
 | --- | --- | --- |
-| 经典前端 | `client/`（React，package 名 `dashboard` 0.1.0），`Makefile` 里 `CLIENT_DIR = client` | 文件还在，但 Makefile 与 CI 默认都不再构建它（CI 可用 `client_dir` 输入切回） |
-| 新版前端 | 整棵删除（`client_v2/`，约 840 个文件） | `client_v2/`（SolidJS，package 名 `dashboard` 3.0.0，webpack + vitest + orval），`Makefile` 里 `CLIENT_DIR = client_v2` |
-| 新版后端 | 整棵删除（`internal/next/`，28 个文件） | `internal/next/`，靠 `NEXTAPI=1`（`scripts/make/go-build.sh` 变成 `--tags=next`）和根目录 `main_next.go`（`//go:build next`）构建 |
+| 经典前端 | `client/`（React，旧界面）还在，但已不构建、不打包 | 文件还在，但 Makefile 与 CI 默认都不再构建它（CI 可用 `client_dir` 输入切回） |
+| 新版前端 | `client_v2/`（SolidJS，package 名 `dashboard` 3.0.0，webpack + vitest + orval），`Makefile` 里 `CLIENT_DIR = client_v2` | 同上，默认构建 |
+| 新版后端 | `internal/next/` 未引入；`NEXTAPI = 0`，继续走经典 `/control/*` 与 `internal/` 里的老后端 | `internal/next/`，靠 `NEXTAPI=1`（`scripts/make/go-build.sh` 变成 `--tags=next`）和根目录 `main_next.go`（`//go:build next`）构建 |
 
 上游把默认前端切到 `client_v2` 是在提交 `09ae3ccd`（`AGDNS-3549-new-ui-edge`）；根目录 `main.go` 与 `main_next.go` 都 embed 同一个 `build/` 目录，所以「用哪套前端」和「用哪套后端」是两件可以分开决定的事。
 

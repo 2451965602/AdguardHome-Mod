@@ -183,7 +183,6 @@ func TestInspectQUICOutsideConfiguredPortsPassesWithoutInspection(t *testing.T) 
 		Logger: slogutil.NewDiscardLogger(),
 		Filter: filter,
 		Params: Params{
-			Enabled:     true,
 			Ports:       []uint16{443},
 			InspectQUIC: true,
 			QUICPorts:   []uint16{853},
