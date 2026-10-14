@@ -60,6 +60,19 @@ export const Menu = (props: Props) => {
                         </span>
                     </Link>
                 </div>
+                <div class={s.menuLinkWrapper}>
+                    <Link
+                        class={cn(s.menuLink, {
+                            [s.activeLink]: isActive(Paths.Clients),
+                        })}
+                        to={RoutePath.Clients}
+                    >
+                        <Icon class={s.linkIcon} icon="user" />
+                        <span class={theme.common.textOverflow}>
+                            {intl.getMessage('clients')}
+                        </span>
+                    </Link>
+                </div>
                 <AccordionSection
                     title={intl.getMessage('settings')}
                     icon="settings"

@@ -15,6 +15,8 @@ import { Allowlists } from 'panel/components/FilterLists/Allowlists';
 import { DNSRewrites } from 'panel/components/FilterLists/DNSRewrites';
 import { Dashboard } from 'panel/components/Dashboard';
 import { QueryLog } from 'panel/components/QueryLog';
+import { Clients } from 'panel/components/Clients/Clients';
+import { AddClient } from 'panel/components/Clients/AddClient/AddClient';
 import { Toasts } from 'panel/components/Toasts';
 import { THEMES } from '../../helpers/constants';
 import { setHtmlLangAttr, setUITheme } from '../../helpers/helpers';
@@ -119,6 +121,9 @@ const App = () => {
             <Route path={Paths.TopUpstreams} component={TopUpstreamsPage} />
             <Route path={Paths.UpstreamAvgTime} component={UpstreamAvgTimePage} />
             <Route path={Paths.SettingsPage} component={Settings} />
+            <Route path={Paths.Clients} component={Clients} />
+            <Route path={Paths.ClientsAdd} component={AddClient} />
+            <Route path={Paths.ClientsEdit} component={AddClient} />
             <Route path={Paths.Dns} component={DnsSettings} />
             <Route path={Paths.DnsPrivateReverse} component={PrivateReverse} />
             <Route path={Paths.DnsBlocklists} component={Blocklists} />
