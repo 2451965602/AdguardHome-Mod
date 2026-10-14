@@ -14,14 +14,23 @@ func TestValidateSNIFilterUIDs(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name    string
-		data    string
-		wantErr bool
+		name       string
+		data       string
+		wantErrMsg string
 	}{
 		{
-			name:    "missing",
-			data:    "sni_filter:\n  ports: [443]\n",
-			wantErr: true,
+			name: "missing_sni_filter",
+			data: "other: value\n",
+		},
+		{
+			name:       "missing_uids",
+			data:       "sni_filter:\n  ports: [443]\n",
+			wantErrMsg: "sni_filter.uids: missing",
+		},
+		{
+			name:       "non_list",
+			data:       "sni_filter:\n  uids: 10000\n",
+			wantErrMsg: "sni_filter.uids: must be a list",
 		},
 		{
 			name: "explicit_empty",
@@ -38,8 +47,8 @@ func TestValidateSNIFilterUIDs(t *testing.T) {
 			t.Parallel()
 
 			err := validateSNIFilterUIDs([]byte(tc.data))
-			if tc.wantErr {
-				require.ErrorContains(t, err, "sni_filter.uids: missing")
+			if tc.wantErrMsg != "" {
+				require.ErrorContains(t, err, tc.wantErrMsg)
 			} else {
 				require.NoError(t, err)
 			}

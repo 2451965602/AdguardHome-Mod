@@ -760,26 +760,28 @@ func validateConfig(ctx context.Context, l *slog.Logger, fileData []byte) (err e
 // validateSNIFilterUIDs rejects a missing or non-list sni_filter.uids value.
 // An explicitly empty list is valid and means all processes.
 func validateSNIFilterUIDs(fileData []byte) (err error) {
-	var conf struct {
-		SNIFilter *struct {
-			UIDs *yaml.Node `yaml:"uids"`
-		} `yaml:"sni_filter"`
-	}
+	var conf map[string]any
 
 	err = yaml.Unmarshal(fileData, &conf)
 	if err != nil {
 		return fmt.Errorf("parsing sni_filter.uids: %w", err)
 	}
 
-	if conf.SNIFilter == nil {
+	sniFilter, ok := conf["sni_filter"]
+	if !ok {
 		return nil
 	}
 
-	if conf.SNIFilter.UIDs == nil {
+	sniFilterMap, ok := sniFilter.(map[string]any)
+	if !ok {
+		return fmt.Errorf("sni_filter.uids: must be a list")
+	}
+	uids, ok := sniFilterMap["uids"]
+	if !ok {
 		return fmt.Errorf("sni_filter.uids: missing")
 	}
 
-	if conf.SNIFilter.UIDs.Kind != yaml.SequenceNode {
+	if _, ok = uids.([]any); !ok {
 		return fmt.Errorf("sni_filter.uids: must be a list")
 	}
 
